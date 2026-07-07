@@ -4,9 +4,6 @@
 
 ![Playing Bilibili on the Tesla screen while the car is in motion](img/tesla-in-car.png)
 
-*In motion at 70 mph: Tesla shows its "Video limited to audio only" banner — and the
-canvas player keeps playing anyway.*
-
 Watch **Bilibili** in the **Tesla in-car browser** — with your own account, at full
 quality, and **without the picture freezing when the car leaves Park**.
 
