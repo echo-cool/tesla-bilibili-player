@@ -2,6 +2,11 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
+![Playing Bilibili on the Tesla screen while the car is in motion](img/tesla-in-car.png)
+
+*In motion at 70 mph: Tesla shows its "Video limited to audio only" banner — and the
+canvas player keeps playing anyway.*
+
 Watch **Bilibili** in the **Tesla in-car browser** — with your own account, at full
 quality, and **without the picture freezing when the car leaves Park**.
 
@@ -11,11 +16,6 @@ uses a `<video>` element. The backend resolves Bilibili's DASH stream, and the f
 **demuxes + decodes it with WebCodecs and paints frames onto a `<canvas>`**, with audio
 via the **Web Audio API**. To the car, that looks like an ordinary animated page plus app
 audio — which is not restricted — so playback keeps running.
-
-![Playing Bilibili on the Tesla screen while the car is in motion](img/tesla-in-car.png)
-
-*In motion at 70 mph: Tesla shows its "Video limited to audio only" banner — and the
-canvas player keeps playing anyway.*
 
 > ⚠️ **Safety & use.** This defeats a driving-safety feature. Use it as a **passenger**,
 > not while driving. It's intended for personal use with your own Bilibili account. You
