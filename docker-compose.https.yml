@@ -1,0 +1,62 @@
+# Self-contained HTTPS deployment.
+#
+# Caddy terminates TLS (automatic Let's Encrypt certs) and reverse-proxies to the
+# app. The app is NOT exposed to the host — only Caddy's 80/443 are public.
+#
+# Usage on the target server:
+#   1. Point your domain's DNS A/AAAA record at this server's public IP.
+#   2. Open ports 80 and 443 in the firewall.
+#   3. cp .env.example .env, then set DOMAIN, ACME_EMAIL, and SESSION_SECRET.
+#   4. docker compose -f docker-compose.https.yml up -d --build
+#   5. Browse to https://<your-domain>  (first load waits ~10s for the cert)
+
+services:
+  app:
+    build: .
+    image: tesla-bili-player
+    environment:
+      - NODE_ENV=production
+      - PORT=8080
+      - SESSION_SECRET=${SESSION_SECRET:?set SESSION_SECRET in .env}
+      # In-app password gate. Set to require a password before anyone can browse
+      # or watch; leave empty for open access.
+      - SITE_PASSWORD=${SITE_PASSWORD:-}
+      # This player uses WebCodecs (no SharedArrayBuffer), so cross-origin
+      # isolation is unnecessary. 'off' avoids any COEP resource restrictions.
+      - COEP=${COEP:-off}
+      # Log verbosity: debug | info | warn | error
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+    expose:
+      - '8080'
+    # Explicit DNS: the host's systemd-resolved stub (127.0.0.53) isn't reachable
+    # from containers, which breaks name resolution (Bilibili API, etc.).
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    environment:
+      # Set these in .env: your hostname and a Let's Encrypt contact address.
+      - DOMAIN=${DOMAIN:?set DOMAIN in .env}
+      - ACME_EMAIL=${ACME_EMAIL:-}
+    ports:
+      - '80:80'
+      - '443:443'
+      - '443:443/udp' # HTTP/3
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data # persists issued certs across restarts (avoid rate limits)
+      - caddy_config:/config
+    depends_on:
+      - app
+    # Explicit DNS so Caddy can resolve the ACME CA (Let's Encrypt / ZeroSSL).
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:

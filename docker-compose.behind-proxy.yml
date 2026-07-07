@@ -1,0 +1,31 @@
+# Run ONLY the app (no bundled Caddy) when the server already has a reverse proxy
+# terminating TLS on 80/443 — e.g. you already run Caddy/Traefik/Nginx for other
+# services. The app binds to 127.0.0.1:8080 (not public); point your existing
+# proxy's vhost for your domain at http://127.0.0.1:8080.
+#
+#   echo "SESSION_SECRET=$(openssl rand -hex 32)" > .env
+#   docker compose -f docker-compose.behind-proxy.yml up -d --build
+
+services:
+  app:
+    build: .
+    image: tesla-bili-player
+    environment:
+      - NODE_ENV=production
+      - PORT=8080
+      - SESSION_SECRET=${SESSION_SECRET:?set SESSION_SECRET in .env}
+      # In-app password gate (empty = open access).
+      - SITE_PASSWORD=${SITE_PASSWORD:-}
+      # WebCodecs needs no cross-origin isolation; 'off' avoids COEP restrictions.
+      - COEP=${COEP:-off}
+      # Log verbosity: debug | info | warn | error
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+    ports:
+      # Bound to localhost only — reachable by the host's reverse proxy, not the internet.
+      - '127.0.0.1:8080:8080'
+    # Explicit DNS: the host's systemd-resolved stub (127.0.0.53) isn't reachable
+    # from containers, which breaks name resolution (Bilibili API, etc.).
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    restart: unless-stopped

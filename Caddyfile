@@ -1,0 +1,13 @@
+# Caddy config for the HTTPS deployment (docker-compose.https.yml).
+# DOMAIN and ACME_EMAIL come from the environment.
+
+{
+	# Empty when ACME_EMAIL is unset — Caddy still issues certs, just without a
+	# contact address. Set ACME_EMAIL in .env to receive expiry notices.
+	email {$ACME_EMAIL}
+}
+
+{$DOMAIN} {
+	encode zstd gzip
+	reverse_proxy app:8080
+}

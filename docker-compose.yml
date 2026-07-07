@@ -1,0 +1,20 @@
+services:
+  player:
+    build: .
+    image: tesla-bili-player
+    ports:
+      - '8080:8080'
+    environment:
+      - NODE_ENV=production
+      - PORT=8080
+      - SESSION_SECRET=${SESSION_SECRET:-please-change-me}
+      - SITE_PASSWORD=${SITE_PASSWORD:-}
+      - COEP=${COEP:-off}
+      # Log verbosity: debug | info | warn | error
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+    # Explicit DNS: the host's systemd-resolved stub (127.0.0.53) isn't reachable
+    # from containers on some hosts, breaking name resolution (Bilibili API, etc.).
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    restart: unless-stopped
