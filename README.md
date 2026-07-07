@@ -7,8 +7,7 @@
 Watch **Bilibili** in the **Tesla in-car browser** — with your own account, at full
 quality, and **without the picture freezing when the car leaves Park**.
 
-Tesla's browser freezes/blocks `<video>` elements once the car is in motion. This app
-sidesteps that the same way [tesla-player.com](https://tesla-player.com) does: it never
+Tesla's browser freezes/blocks `<video>` elements once the car is in motion. This app never
 uses a `<video>` element. The backend resolves Bilibili's DASH stream, and the frontend
 **demuxes + decodes it with WebCodecs and paints frames onto a `<canvas>`**, with audio
 via the **Web Audio API**. To the car, that looks like an ordinary animated page plus app
