@@ -38,9 +38,19 @@ const MAX_OUTSTANDING_FRAMES = 5;
 // wedged and recover by reinitializing at the current position.
 const VIDEO_STALL_MS = 4000;
 const MAX_STALL_RECOVERIES = 3;
-// Seconds of decoded audio to keep scheduled ahead of the clock.
-const AUDIO_SCHEDULE_AHEAD = 1.5;
-const AUDIO_DECODE_AHEAD = 3;
+// Keep 4–6s of audio scheduled: refill whenever the chain drops below LOW,
+// filling up to HIGH. The band makes playback immune to multi-second
+// main-thread stalls (mp4box appends, GC — routine on the Tesla's SoC), and
+// each refill batches ~2s of decoder chunks into ONE AudioBufferSourceNode
+// instead of one node per ~23ms chunk (fewer seams, far less node/GC churn).
+const AUDIO_AHEAD_LOW = 4;
+const AUDIO_AHEAD_HIGH = 6;
+const AUDIO_DECODE_AHEAD = 8;
+// Timeline jumps larger than this break the sample-accurate chain and re-anchor
+// on the container timestamp; smaller deviations keep following the chain.
+const AUDIO_DISCONTINUITY_SEC = 0.25;
+// How often the fallback timer pumps/schedules audio when rAF is throttled.
+const AUDIO_TICK_MS = 250;
 
 /**
  * Anti-freeze video player: demuxes Bilibili DASH, decodes with WebCodecs, paints
@@ -99,6 +109,7 @@ export class CanvasPlayer {
   private lastTimeReportMs = 0;
   private expiredSignaled = false;
   private raf = 0;
+  private audioTimer = 0;
   private canvasSized = false;
 
   // Stats (for the debug overlay).
@@ -173,6 +184,10 @@ export class CanvasPlayer {
 
     void this.videoDemuxer.start(0);
     void this.audioDemuxer.start(0);
+    // Playback must keep flowing even when rAF is throttled or stopped
+    // (fullscreen transitions, hidden/obscured page): a timer-driven tick
+    // backs up the render loop. tick() is idempotent, so overlap is harmless.
+    this.audioTimer = window.setInterval(() => this.tick(), AUDIO_TICK_MS);
     this.loop();
   }
 
@@ -267,7 +282,12 @@ export class CanvasPlayer {
   // ---------- main loop ----------
 
   private loop = () => {
-    // One bad tick must never kill the render loop (which also drives backpressure).
+    this.tick();
+    this.raf = requestAnimationFrame(this.loop);
+  };
+
+  private tick() {
+    // One bad tick must never kill the loop (which also drives backpressure).
     try {
       this.pumpVideo();
       this.pumpAudio();
@@ -288,8 +308,7 @@ export class CanvasPlayer {
     } catch (e) {
       report('error', 'player', 'tick error: ' + errMsg(e));
     }
-    this.raf = requestAnimationFrame(this.loop);
-  };
+  }
 
   /**
    * Detects a wedged video decoder (playing, data available, but no frame output
@@ -357,9 +376,12 @@ export class CanvasPlayer {
     const dec = this.audioDecoder;
     if (!dec || dec.state !== 'configured') return;
     const clock = this.getMediaTime();
+    // The in-flight cap must let one tick feed >1s of audio (64 × ~23ms ≈
+    // 1.5s): when rAF is throttled the 4Hz fallback timer is the only pump,
+    // and a 16-chunk cap would barely keep up with realtime consumption.
     while (
       this.aIdx < this.encodedAudio.length &&
-      dec.decodeQueueSize < 16 &&
+      dec.decodeQueueSize < 64 &&
       this.decodedAudioAheadSec(clock) < AUDIO_DECODE_AHEAD
     ) {
       const s = this.encodedAudio[this.aIdx++];
@@ -388,14 +410,22 @@ export class CanvasPlayer {
   private maybePrime() {
     const haveVideo = this.frameQueue.length > 0;
     const haveAudio = this.decodedAudio.length > 0 || this.audioDone;
-    if (haveVideo && haveAudio) {
-      this.ctxStartTime = this.audioCtx.currentTime + 0.08;
-      if (this.wantPlaying) {
-        this.resumeAudio();
-      } else {
-        void this.audioCtx.suspend();
-        this.setState('paused');
-      }
+    if (!haveVideo || !haveAudio) return;
+    // The container's stsd can lie about the sample rate (HE-AAC signals its
+    // core rate; the decoder outputs the true one). A context/output mismatch
+    // makes every source node resample on its own — constant crackle — so
+    // rebuild the graph at the decoder's real rate before the clock starts.
+    const first = this.decodedAudio[0];
+    if (first && first.sampleRate !== this.audioCtx.sampleRate) {
+      if (this.audioConfig) this.audioConfig.sampleRate = first.sampleRate;
+      this.matchAudioContextRate(first.sampleRate);
+    }
+    this.ctxStartTime = this.audioCtx.currentTime + 0.08;
+    if (this.wantPlaying) {
+      this.resumeAudio();
+    } else {
+      void this.audioCtx.suspend();
+      this.setState('paused');
     }
   }
 
@@ -430,50 +460,103 @@ export class CanvasPlayer {
   private scheduleAudio() {
     if (this.ctxStartTime === null) return;
     const now = this.audioCtx.currentTime;
+    // Refill only when the chain runs low, then top it up to the HIGH mark in
+    // one go — big contiguous batches, one source node each.
+    if (this.nextAudioStartTime !== 0 && this.nextAudioStartTime - now > AUDIO_AHEAD_LOW) return;
+
     while (this.decodedAudio.length) {
-      const data = this.decodedAudio[0];
-      const mediaTs = data.timestamp / 1e6;
-      const idealWhen = this.ctxStartTime + (mediaTs - this.baseMediaTime);
+      const head = this.decodedAudio[0];
+      const rate = head.sampleRate;
+      const channels = head.numberOfChannels;
+      const headTs = head.timestamp / 1e6;
+      const headDur = head.numberOfFrames / rate;
+
+      // Fresh chain (after load/seek): the demuxer restarts at a segment
+      // boundary, so the first chunks can predate the target position. Drop
+      // them, and start part-way into the chunk that straddles the target.
+      let startOffsetSec = 0;
+      if (this.nextAudioStartTime === 0) {
+        if (headTs + headDur <= this.baseMediaTime) {
+          this.decodedAudio.shift();
+          head.close();
+          continue;
+        }
+        startOffsetSec = Math.min(Math.max(0, this.baseMediaTime - headTs), headDur);
+      }
+
+      const effTs = headTs + startOffsetSec; // media time of the first audible sample
+      const idealWhen = this.ctxStartTime + (effTs - this.baseMediaTime);
+
       // Chain chunks sample-accurately: each starts exactly where the previous
       // one ends. Container timestamps are rounded to whole microseconds, so
-      // scheduling by timestamp leaves sub-sample seams between chunks —
-      // audible as periodic clicks at higher volume. The timestamp is only a
-      // fallback when it genuinely disagrees with the chain (first chunk,
-      // post-seek, dropped chunk, or the chain slipped into the past after a
-      // main-thread stall).
-      let when = this.nextAudioStartTime;
-      if (when === 0 || when < now || Math.abs(when - idealWhen) > 0.05) {
-        when = Math.max(idealWhen, now);
-      }
-      // Only schedule within the look-ahead window.
-      if (when > now + AUDIO_SCHEDULE_AHEAD) break;
-      this.decodedAudio.shift();
-
-      const chLayout = data.numberOfChannels;
-      const frames = data.numberOfFrames;
-      const rate = data.sampleRate;
-      const buf = this.audioCtx.createBuffer(chLayout, frames, rate);
-      for (let ch = 0; ch < chLayout; ch++) {
-        const tmp = new Float32Array(frames);
-        try {
-          data.copyTo(tmp, { planeIndex: ch, format: 'f32-planar' });
-        } catch {
-          // Some decoders emit interleaved; fall back to plane 0.
-          data.copyTo(tmp, { planeIndex: 0, format: 'f32-planar' });
+      // scheduling by timestamp would leave sub-sample seams between chunks —
+      // audible as periodic clicks at higher volume.
+      let when: number;
+      if (this.nextAudioStartTime === 0) {
+        when = Math.max(idealWhen, now + 0.02);
+      } else {
+        when = this.nextAudioStartTime;
+        if (when < now) {
+          // Underrun: the main thread stalled past the scheduled lookahead and
+          // the chain slipped into the past. Restart just ahead of `now` and
+          // shift the clock base so media time follows the audio that actually
+          // plays — video re-syncs to audio and the chain stays aligned with
+          // the timestamps. (Clamping each chunk to `now` without rebasing
+          // stacks all pending chunks at the same instant: garbled audio.)
+          const target = now + 0.05;
+          this.ctxStartTime += target - idealWhen;
+          when = target;
+          report('warn', 'player', `audio underrun — clock rebased ${(target - idealWhen).toFixed(3)}s`);
+        } else if (Math.abs(idealWhen - when) > AUDIO_DISCONTINUITY_SEC) {
+          // Genuine jump in the audio timeline (gap in the track): break the
+          // chain once and re-anchor on the timestamp. Never schedule before
+          // the chain's end — overlapping sources sound torn.
+          when = Math.max(idealWhen, this.nextAudioStartTime);
         }
-        buf.copyToChannel(tmp, ch);
       }
-      const dur = frames / rate;
-      data.close();
+      if (when > now + AUDIO_AHEAD_HIGH) break;
+
+      // Coalesce every already-decoded chunk that continues this one
+      // seamlessly into a single AudioBuffer/source node.
+      const batch: AudioData[] = [this.decodedAudio.shift()!];
+      let frames = head.numberOfFrames;
+      let endTs = headTs + headDur;
+      while (this.decodedAudio.length) {
+        const nxt = this.decodedAudio[0];
+        if (nxt.sampleRate !== rate || nxt.numberOfChannels !== channels) break;
+        if (Math.abs(nxt.timestamp / 1e6 - endTs) > 0.02) break; // not contiguous
+        if (when + frames / rate >= now + AUDIO_AHEAD_HIGH) break; // window is full
+        this.decodedAudio.shift();
+        batch.push(nxt);
+        frames += nxt.numberOfFrames;
+        endTs = nxt.timestamp / 1e6 + nxt.numberOfFrames / rate;
+      }
+
+      const buf = this.audioCtx.createBuffer(channels, frames, rate);
+      let offset = 0;
+      for (const data of batch) {
+        for (let ch = 0; ch < channels; ch++) {
+          const tmp = new Float32Array(data.numberOfFrames);
+          try {
+            data.copyTo(tmp, { planeIndex: ch, format: 'f32-planar' });
+          } catch {
+            // Some decoders emit interleaved; fall back to plane 0.
+            data.copyTo(tmp, { planeIndex: 0, format: 'f32-planar' });
+          }
+          buf.copyToChannel(tmp, ch, offset);
+        }
+        offset += data.numberOfFrames;
+        data.close();
+      }
 
       const src = this.audioCtx.createBufferSource();
       src.buffer = buf;
       src.connect(this.gain);
-      src.start(when);
+      src.start(when, startOffsetSec);
       this.activeSources.add(src);
       src.onended = () => this.activeSources.delete(src);
-      this.nextAudioStartTime = when + dur;
-      this.lastAudioScheduledSec = mediaTs + dur;
+      this.nextAudioStartTime = when + (frames / rate - startOffsetSec);
+      this.lastAudioScheduledSec = endTs;
     }
   }
 
@@ -656,6 +739,8 @@ export class CanvasPlayer {
   private teardownPipeline() {
     if (this.raf) cancelAnimationFrame(this.raf);
     this.raf = 0;
+    if (this.audioTimer) clearInterval(this.audioTimer);
+    this.audioTimer = 0;
     this.videoDemuxer?.destroy();
     this.audioDemuxer?.destroy();
     this.videoDemuxer = null;

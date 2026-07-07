@@ -36,7 +36,11 @@ export function Login() {
             const r = await api.pollQr(qrcodeKey);
             if (r.loggedIn) {
               setStatus('Logged in!');
-              await refresh();
+              try {
+                await refresh();
+              } catch {
+                /* status refetch failed — navigate anyway; Home will retry */
+              }
               nav('/');
               return;
             }

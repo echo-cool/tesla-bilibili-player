@@ -37,6 +37,15 @@ if (config.coep !== 'off') {
 app.use(cookieParser(config.sessionSecret));
 app.use(express.json());
 
+// The Tesla browser serves same-URL GETs (even fetch/XHR) from cache unless
+// told not to — a cached /api/auth/qr/poll or /api/auth/status response makes
+// QR login never complete in the car. Images keep their upstream caching;
+// /api/stream already forces no-store itself.
+app.use('/api', (req, res, next) => {
+  if (!req.path.startsWith('/img')) res.setHeader('Cache-Control', 'no-store');
+  next();
+});
+
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 // Gate: /api/gate/* is open (status + login); everything else under /api is
 // blocked until the site password is entered.
