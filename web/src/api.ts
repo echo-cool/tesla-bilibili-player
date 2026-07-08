@@ -8,7 +8,11 @@ export function setOnLocked(fn: () => void) {
 }
 
 async function get<T>(path: string): Promise<T> {
-  const res = await fetch(path, { credentials: 'include' });
+  // Cache-buster: the Tesla browser serves same-URL GETs from cache even for
+  // fetch/XHR — a stale /auth/qr/poll response makes QR login never complete
+  // in the car. (The server also sends Cache-Control: no-store on /api.)
+  const url = `${path}${path.includes('?') ? '&' : '?'}_=${Date.now()}`;
+  const res = await fetch(url, { credentials: 'include', cache: 'no-store' });
   if (res.status === 401) {
     lockedHandler?.();
     throw new Error('locked');
