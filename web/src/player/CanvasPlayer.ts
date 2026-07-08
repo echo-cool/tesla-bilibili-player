@@ -38,9 +38,17 @@ const MAX_OUTSTANDING_FRAMES = 5;
 // wedged and recover by reinitializing at the current position.
 const VIDEO_STALL_MS = 4000;
 const MAX_STALL_RECOVERIES = 3;
-// Seconds of decoded audio to keep scheduled ahead of the clock.
-const AUDIO_SCHEDULE_AHEAD = 1.5;
-const AUDIO_DECODE_AHEAD = 3;
+// Seconds of decoded audio to keep scheduled ahead of the clock. Tesla's browser
+// can stall the main thread long enough for small Web Audio queues to underrun,
+// so keep a conservative playback cushion.
+const AUDIO_SCHEDULE_AHEAD = 2.5;
+const AUDIO_DECODE_AHEAD = 5;
+const AUDIO_START_DELAY = 0.12;
+const AUDIO_PRIME_BUFFER = 0.35;
+const AUDIO_RESUME_BUFFER = 0.7;
+const AUDIO_UNDERRUN_GUARD = 0.12;
+const AUDIO_BATCH_TARGET_SEC = 0.18;
+const AUDIO_BATCH_GAP_TOLERANCE_SEC = 0.04;
 
 /**
  * Anti-freeze video player: demuxes Bilibili DASH, decodes with WebCodecs, paints
@@ -98,6 +106,10 @@ export class CanvasPlayer {
   private stallRecoveries = 0;
   private lastTimeReportMs = 0;
   private expiredSignaled = false;
+  private suppressAudioElementPause = false;
+  private suppressAudioContextState = false;
+  private audioContextTransitionToken = 0;
+  private destroyed = false;
   private raf = 0;
   private canvasSized = false;
 
@@ -107,20 +119,42 @@ export class CanvasPlayer {
   private droppedFrames = 0;
   private statsMark = { t: 0, rendered: 0, decoded: 0 };
 
+  private onVisibilityChange = () => {
+    if (document.visibilityState === 'hidden') this.pauseForInterruption('document hidden');
+  };
+  private onPageHide = () => this.pauseForInterruption('pagehide');
+  private onPageFreeze = () => this.pauseForInterruption('page freeze');
+  private onWindowBlur = () => this.pauseForInterruption('window blur');
+  private onAudioElementPause = () => {
+    if (this.suppressAudioElementPause || this.destroyed || !this.wantPlaying) return;
+    if (this.state === 'playing' || this.state === 'buffering') {
+      this.pauseForInterruption('audio sink paused externally');
+    }
+  };
+  private onAudioContextStateChange = () => {
+    if (this.suppressAudioContextState || this.destroyed || !this.wantPlaying) return;
+    if (this.audioCtx.state === 'suspended' && this.state === 'playing') {
+      this.pauseForInterruption('audio context suspended externally');
+    }
+  };
+
   constructor(canvas: HTMLCanvasElement, cb: PlayerCallbacks = {}) {
     this.canvas = canvas;
     const ctx = canvas.getContext('2d', { alpha: false });
     if (!ctx) throw new Error('2d canvas context unavailable');
     this.ctx = ctx;
     this.cb = cb;
-    this.audioCtx = new (audioContextClass())();
+    this.audioCtx = createAudioContext();
+    this.audioCtx.onstatechange = this.onAudioContextStateChange;
     this.gain = this.audioCtx.createGain();
     this.mediaDest = this.audioCtx.createMediaStreamDestination();
     this.gain.connect(this.mediaDest);
     this.audioEl = document.createElement('audio');
     this.audioEl.srcObject = this.mediaDest.stream;
     this.audioEl.style.display = 'none';
+    this.audioEl.addEventListener('pause', this.onAudioElementPause);
     document.body.appendChild(this.audioEl);
+    this.installInterruptionHandlers();
   }
 
   static isSupported(): boolean {
@@ -225,7 +259,12 @@ export class CanvasPlayer {
     const oldRate = this.audioCtx.sampleRate;
     let ctx: AudioContext;
     try {
-      ctx = new (audioContextClass())({ sampleRate: rate });
+      ctx = createAudioContext(rate);
+      if (Math.abs(ctx.sampleRate - rate) > 1) {
+        void ctx.close().catch(() => {});
+        report('warn', 'player', `context rate ${rate}Hz unsupported — keeping ${oldRate}Hz`);
+        return;
+      }
     } catch {
       report('warn', 'player', `context rate ${rate}Hz unsupported — keeping ${oldRate}Hz`);
       return;
@@ -236,8 +275,10 @@ export class CanvasPlayer {
       this.baseMediaTime = this.getMediaTime();
       this.ctxStartTime = null;
     }
+    this.audioCtx.onstatechange = null;
     void this.audioCtx.close().catch(() => {});
     this.audioCtx = ctx;
+    this.audioCtx.onstatechange = this.onAudioContextStateChange;
     this.gain = ctx.createGain();
     this.gain.gain.value = this.volume;
     this.mediaDest = ctx.createMediaStreamDestination();
@@ -246,7 +287,7 @@ export class CanvasPlayer {
     this.nextAudioStartTime = 0;
     report('info', 'player', `audio graph rebuilt at ${rate}Hz (device default was ${oldRate}Hz)`);
     if (this.wantPlaying) {
-      void ctx.resume().catch(() => {});
+      void this.resumeAudioContext().catch(() => {});
       void this.audioEl.play().catch(() => {});
     }
   }
@@ -278,6 +319,7 @@ export class CanvasPlayer {
       } else {
         this.scheduleAudio();
         const clock = this.getMediaTime();
+        this.manageAudioContinuity(clock);
         this.presentVideo(clock);
         this.reportTime(clock);
         this.checkEnded(clock);
@@ -360,7 +402,7 @@ export class CanvasPlayer {
     while (
       this.aIdx < this.encodedAudio.length &&
       dec.decodeQueueSize < 16 &&
-      this.decodedAudioAheadSec(clock) < AUDIO_DECODE_AHEAD
+      this.audioReadyAheadSec(clock) < AUDIO_DECODE_AHEAD
     ) {
       const s = this.encodedAudio[this.aIdx++];
       try {
@@ -378,22 +420,26 @@ export class CanvasPlayer {
     }
   }
 
-  private decodedAudioAheadSec(clock: number): number {
+  private audioReadyAheadSec(clock: number): number {
+    return Math.max(0, Math.max(this.lastAudioScheduledSec, this.decodedAudioEndSec()) - clock);
+  }
+
+  private decodedAudioEndSec(): number {
     const last = this.decodedAudio[this.decodedAudio.length - 1];
-    if (!last) return Math.max(0, this.lastAudioScheduledSec - clock);
-    return Math.max(0, last.timestamp / 1e6 - clock);
+    if (!last) return 0;
+    return last.timestamp / 1e6 + last.numberOfFrames / last.sampleRate;
   }
 
   /** Start the clock once we have a first frame and (if present) some audio decoded. */
   private maybePrime() {
     const haveVideo = this.frameQueue.length > 0;
-    const haveAudio = this.decodedAudio.length > 0 || this.audioDone;
+    const haveAudio = this.audioDone || this.audioReadyAheadSec(this.baseMediaTime) >= AUDIO_PRIME_BUFFER;
     if (haveVideo && haveAudio) {
-      this.ctxStartTime = this.audioCtx.currentTime + 0.08;
+      this.ctxStartTime = this.audioCtx.currentTime + AUDIO_START_DELAY;
       if (this.wantPlaying) {
         this.resumeAudio();
       } else {
-        void this.audioCtx.suspend();
+        this.pauseAudioOutput({ pauseSink: true });
         this.setState('paused');
       }
     }
@@ -406,7 +452,8 @@ export class CanvasPlayer {
    * of pretending to play on a frozen first frame.
    */
   private resumeAudio() {
-    Promise.all([this.audioCtx.resume(), this.audioEl.play()])
+    this.resumeFetchers();
+    Promise.all([this.resumeAudioContext(), this.audioEl.play()])
       .then(() => {
         if (this.audioCtx.state === 'running' && !this.audioEl.paused) {
           if (this.state !== 'ended') this.setState('playing');
@@ -415,6 +462,43 @@ export class CanvasPlayer {
         }
       })
       .catch(() => this.setState('paused'));
+  }
+
+  private resumeAudioContext(): Promise<void> {
+    const token = ++this.audioContextTransitionToken;
+    this.suppressAudioContextState = true;
+    return this.audioCtx.resume().finally(() => {
+      if (token === this.audioContextTransitionToken) this.suppressAudioContextState = false;
+    });
+  }
+
+  private pauseAudioOutput({ pauseSink }: { pauseSink: boolean }) {
+    const token = ++this.audioContextTransitionToken;
+    this.suppressAudioContextState = true;
+    void this.audioCtx
+      .suspend()
+      .catch(() => {})
+      .finally(() => {
+        if (token === this.audioContextTransitionToken) this.suppressAudioContextState = false;
+      });
+
+    if (pauseSink && !this.audioEl.paused) {
+      this.suppressAudioElementPause = true;
+      this.audioEl.pause();
+      window.setTimeout(() => {
+        this.suppressAudioElementPause = false;
+      }, 0);
+    }
+  }
+
+  private pauseFetchers() {
+    this.videoDemuxer?.pause();
+    this.audioDemuxer?.pause();
+  }
+
+  private resumeFetchers() {
+    this.videoDemuxer?.resume();
+    this.audioDemuxer?.resume();
   }
 
   private drawFirstFrame() {
@@ -447,33 +531,83 @@ export class CanvasPlayer {
       }
       // Only schedule within the look-ahead window.
       if (when > now + AUDIO_SCHEDULE_AHEAD) break;
-      this.decodedAudio.shift();
-
-      const chLayout = data.numberOfChannels;
-      const frames = data.numberOfFrames;
-      const rate = data.sampleRate;
-      const buf = this.audioCtx.createBuffer(chLayout, frames, rate);
-      for (let ch = 0; ch < chLayout; ch++) {
-        const tmp = new Float32Array(frames);
-        try {
-          data.copyTo(tmp, { planeIndex: ch, format: 'f32-planar' });
-        } catch {
-          // Some decoders emit interleaved; fall back to plane 0.
-          data.copyTo(tmp, { planeIndex: 0, format: 'f32-planar' });
-        }
-        buf.copyToChannel(tmp, ch);
-      }
-      const dur = frames / rate;
-      data.close();
+      const batch = this.takeAudioBatch();
+      if (!batch) break;
 
       const src = this.audioCtx.createBufferSource();
-      src.buffer = buf;
+      src.buffer = batch.buffer;
       src.connect(this.gain);
       src.start(when);
       this.activeSources.add(src);
       src.onended = () => this.activeSources.delete(src);
-      this.nextAudioStartTime = when + dur;
-      this.lastAudioScheduledSec = mediaTs + dur;
+      this.nextAudioStartTime = when + batch.duration;
+      this.lastAudioScheduledSec = mediaTs + batch.duration;
+    }
+  }
+
+  private takeAudioBatch(): { buffer: AudioBuffer; duration: number } | null {
+    const first = this.decodedAudio[0];
+    if (!first) return null;
+
+    const channels = first.numberOfChannels;
+    const rate = first.sampleRate;
+    const batch: AudioData[] = [];
+    let frames = 0;
+    let expectedTs = first.timestamp / 1e6;
+
+    while (this.decodedAudio.length) {
+      const data = this.decodedAudio[0];
+      if (data.numberOfChannels !== channels || data.sampleRate !== rate) break;
+
+      const ts = data.timestamp / 1e6;
+      if (batch.length > 0 && Math.abs(ts - expectedTs) > AUDIO_BATCH_GAP_TOLERANCE_SEC) break;
+
+      this.decodedAudio.shift();
+      batch.push(data);
+      frames += data.numberOfFrames;
+      expectedTs = ts + data.numberOfFrames / data.sampleRate;
+      if (frames / rate >= AUDIO_BATCH_TARGET_SEC) break;
+    }
+
+    if (batch.length === 0) return null;
+    try {
+      const buffer = this.audioCtx.createBuffer(channels, frames, rate);
+      const channelData = Array.from({ length: channels }, () => new Float32Array(frames));
+      let offset = 0;
+
+      for (const data of batch) {
+        for (let ch = 0; ch < channels; ch++) {
+          const dest = channelData[ch].subarray(offset, offset + data.numberOfFrames);
+          try {
+            data.copyTo(dest, { planeIndex: ch, format: 'f32-planar' });
+          } catch {
+            // Some decoders emit interleaved; fall back to plane 0 rather than
+            // dropping the chunk and causing an audible hole.
+            data.copyTo(dest, { planeIndex: 0, format: 'f32-planar' });
+          }
+        }
+        offset += data.numberOfFrames;
+      }
+      for (let ch = 0; ch < channels; ch++) buffer.copyToChannel(channelData[ch], ch);
+      return { buffer, duration: frames / rate };
+    } finally {
+      for (const data of batch) data.close();
+    }
+  }
+
+  private manageAudioContinuity(clock: number) {
+    if (!this.wantPlaying || this.ctxStartTime === null || this.state === 'ended' || this.state === 'error') return;
+
+    const readyAhead = this.audioReadyAheadSec(clock);
+    if (this.state === 'playing' && readyAhead < AUDIO_UNDERRUN_GUARD && !this.audioDone) {
+      report('warn', 'player', `audio underrun guard at t=${clock.toFixed(2)} ready=${readyAhead.toFixed(2)}s`);
+      this.pauseAudioOutput({ pauseSink: false });
+      this.setState('buffering');
+      return;
+    }
+
+    if (this.state === 'buffering' && readyAhead >= AUDIO_RESUME_BUFFER) {
+      this.resumeAudio();
     }
   }
 
@@ -519,13 +653,17 @@ export class CanvasPlayer {
     ) {
       if (this.state !== 'ended') {
         this.setState('ended');
-        void this.audioCtx.suspend();
+        this.pauseAudioOutput({ pauseSink: true });
       }
     }
   }
 
   private manageBackpressure() {
     if (this.seeking) return; // don't fight the seek's pause/seekTo/resume sequence
+    if (!this.wantPlaying) {
+      this.pauseFetchers();
+      return;
+    }
     const clock = this.getMediaTime();
     this.applyBackpressure(this.videoDemuxer, this.encodedVideo, clock);
     this.applyBackpressure(this.audioDemuxer, this.encodedAudio, clock);
@@ -549,15 +687,56 @@ export class CanvasPlayer {
     else if (ahead < BUFFER_LOW) dmx.resume();
   }
 
+  private installInterruptionHandlers() {
+    document.addEventListener('visibilitychange', this.onVisibilityChange);
+    window.addEventListener('pagehide', this.onPageHide);
+    document.addEventListener('freeze', this.onPageFreeze);
+    window.addEventListener('blur', this.onWindowBlur);
+    this.installMediaSessionHandlers();
+  }
+
+  private removeInterruptionHandlers() {
+    document.removeEventListener('visibilitychange', this.onVisibilityChange);
+    window.removeEventListener('pagehide', this.onPageHide);
+    document.removeEventListener('freeze', this.onPageFreeze);
+    window.removeEventListener('blur', this.onWindowBlur);
+    this.clearMediaSessionHandlers();
+  }
+
+  private installMediaSessionHandlers() {
+    const session = navigator.mediaSession;
+    if (!session) return;
+    try {
+      session.setActionHandler('play', () => this.play());
+      session.setActionHandler('pause', () => this.pauseForInterruption('media session pause'));
+      session.setActionHandler('stop', () => this.pauseForInterruption('media session stop'));
+    } catch {
+      /* media-session actions are optional per browser */
+    }
+  }
+
+  private clearMediaSessionHandlers() {
+    const session = navigator.mediaSession;
+    if (!session) return;
+    try {
+      session.setActionHandler('play', null);
+      session.setActionHandler('pause', null);
+      session.setActionHandler('stop', null);
+    } catch {
+      /* ignore */
+    }
+  }
+
   // ---------- controls ----------
 
   play() {
     this.wantPlaying = true;
+    this.resumeFetchers();
     if (this.ctxStartTime === null) {
       // Not primed yet — maybePrime will start playback. But this call usually
       // comes from a user gesture, so spend it now to unlock the audio pipeline;
       // maybePrime's resumeAudio runs outside any gesture and would be blocked.
-      void this.audioCtx.resume().catch(() => {});
+      void this.resumeAudioContext().catch(() => {});
       void this.audioEl.play().catch(() => {});
       return;
     }
@@ -570,8 +749,20 @@ export class CanvasPlayer {
 
   pause() {
     this.wantPlaying = false;
-    if (this.ctxStartTime !== null) {
-      void this.audioCtx.suspend();
+    this.pauseFetchers();
+    if (this.ctxStartTime !== null || this.state === 'buffering') {
+      this.pauseAudioOutput({ pauseSink: true });
+      if (this.state !== 'ended' && this.state !== 'error') this.setState('paused');
+    }
+  }
+
+  private pauseForInterruption(reason: string) {
+    if (this.destroyed || (!this.wantPlaying && this.state !== 'playing' && this.state !== 'buffering')) return;
+    report('info', 'player', `pausing playback: ${reason}`);
+    this.wantPlaying = false;
+    this.pauseFetchers();
+    this.pauseAudioOutput({ pauseSink: true });
+    if (this.state !== 'ended' && this.state !== 'error') {
       this.setState('paused');
     }
   }
@@ -687,10 +878,14 @@ export class CanvasPlayer {
   }
 
   destroy() {
+    this.destroyed = true;
+    this.removeInterruptionHandlers();
     this.teardownPipeline();
-    this.audioEl.pause();
+    this.audioEl.removeEventListener('pause', this.onAudioElementPause);
+    this.pauseAudioOutput({ pauseSink: true });
     this.audioEl.srcObject = null;
     this.audioEl.remove();
+    this.audioCtx.onstatechange = null;
     void this.audioCtx.close();
     this.setState('idle');
   }
@@ -747,7 +942,18 @@ export class CanvasPlayer {
   private setState(s: PlayerState) {
     if (this.state === s) return;
     this.state = s;
+    this.setMediaSessionState(s);
     this.cb.onStateChange?.(s);
+  }
+
+  private setMediaSessionState(s: PlayerState) {
+    const session = navigator.mediaSession;
+    if (!session) return;
+    try {
+      session.playbackState = s === 'playing' ? 'playing' : s === 'idle' ? 'none' : 'paused';
+    } catch {
+      /* ignore */
+    }
   }
 
   private fail(message: string) {
@@ -765,4 +971,23 @@ function audioContextClass(): typeof AudioContext {
   return (
     window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext
   );
+}
+
+function createAudioContext(sampleRate?: number): AudioContext {
+  const Ctor = audioContextClass();
+  const opts: AudioContextOptions = { latencyHint: 'playback' };
+  if (sampleRate) opts.sampleRate = sampleRate;
+
+  try {
+    return new Ctor(opts);
+  } catch {
+    if (sampleRate) {
+      try {
+        return new Ctor({ sampleRate });
+      } catch {
+        /* fall through */
+      }
+    }
+    return new Ctor();
+  }
 }
