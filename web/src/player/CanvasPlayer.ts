@@ -38,17 +38,24 @@ const MAX_OUTSTANDING_FRAMES = 5;
 // wedged and recover by reinitializing at the current position.
 const VIDEO_STALL_MS = 4000;
 const MAX_STALL_RECOVERIES = 3;
-// Seconds of decoded audio to keep scheduled ahead of the clock. Tesla's browser
-// can stall the main thread long enough for small Web Audio queues to underrun,
-// so keep a conservative playback cushion.
-const AUDIO_SCHEDULE_AHEAD = 2.5;
-const AUDIO_DECODE_AHEAD = 5;
+// Keep a deep, sample-continuous queue on the audio render thread. mp4box,
+// canvas painting, GC, and rAF throttling can block Tesla's relatively slow
+// browser main thread for seconds at a time. Short AudioBufferSourceNode chains
+// turn those stalls into the repeated syllables/static users hear as tearing.
+const AUDIO_AHEAD_LOW = 4;
+const AUDIO_AHEAD_HIGH = 6;
+const AUDIO_DECODE_AHEAD = 8;
 const AUDIO_START_DELAY = 0.12;
 const AUDIO_PRIME_BUFFER = 0.35;
 const AUDIO_RESUME_BUFFER = 0.7;
 const AUDIO_UNDERRUN_GUARD = 0.12;
-const AUDIO_BATCH_TARGET_SEC = 0.18;
-const AUDIO_BATCH_GAP_TOLERANCE_SEC = 0.04;
+// Container timestamps are only used to break the sample-accurate chain when
+// there is a genuine timeline discontinuity.
+const AUDIO_DISCONTINUITY_SEC = 0.25;
+const AUDIO_BATCH_GAP_TOLERANCE_SEC = 0.002;
+// rAF can be throttled independently of audio in the in-car browser. This timer
+// keeps decoding/scheduling alive when that happens.
+const AUDIO_TICK_MS = 250;
 
 /**
  * Anti-freeze video player: demuxes Bilibili DASH, decodes with WebCodecs, paints
@@ -111,6 +118,7 @@ export class CanvasPlayer {
   private audioContextTransitionToken = 0;
   private destroyed = false;
   private raf = 0;
+  private audioTimer = 0;
   private canvasSized = false;
 
   // Stats (for the debug overlay).
@@ -207,6 +215,7 @@ export class CanvasPlayer {
 
     void this.videoDemuxer.start(0);
     void this.audioDemuxer.start(0);
+    this.audioTimer = window.setInterval(() => this.tick(), AUDIO_TICK_MS);
     this.loop();
   }
 
@@ -238,7 +247,6 @@ export class CanvasPlayer {
 
   private configureAudio(c: AudioConfig) {
     this.audioConfig = c;
-    if (this.audioCtx.sampleRate !== c.sampleRate) this.matchAudioContextRate(c.sampleRate);
     this.audioDecoder?.configure({
       codec: c.codec,
       sampleRate: c.sampleRate,
@@ -308,6 +316,11 @@ export class CanvasPlayer {
   // ---------- main loop ----------
 
   private loop = () => {
+    this.tick();
+    this.raf = requestAnimationFrame(this.loop);
+  };
+
+  private tick() {
     // One bad tick must never kill the render loop (which also drives backpressure).
     try {
       this.pumpVideo();
@@ -330,8 +343,7 @@ export class CanvasPlayer {
     } catch (e) {
       report('error', 'player', 'tick error: ' + errMsg(e));
     }
-    this.raf = requestAnimationFrame(this.loop);
-  };
+  }
 
   /**
    * Detects a wedged video decoder (playing, data available, but no frame output
@@ -399,9 +411,11 @@ export class CanvasPlayer {
     const dec = this.audioDecoder;
     if (!dec || dec.state !== 'configured') return;
     const clock = this.getMediaTime();
+    // One timer tick must be able to submit well over a second of AAC. A cap of
+    // 16 chunks is only ~0.35s and cannot keep up when Tesla throttles rAF.
     while (
       this.aIdx < this.encodedAudio.length &&
-      dec.decodeQueueSize < 16 &&
+      dec.decodeQueueSize < 64 &&
       this.audioReadyAheadSec(clock) < AUDIO_DECODE_AHEAD
     ) {
       const s = this.encodedAudio[this.aIdx++];
@@ -434,14 +448,22 @@ export class CanvasPlayer {
   private maybePrime() {
     const haveVideo = this.frameQueue.length > 0;
     const haveAudio = this.audioDone || this.audioReadyAheadSec(this.baseMediaTime) >= AUDIO_PRIME_BUFFER;
-    if (haveVideo && haveAudio) {
-      this.ctxStartTime = this.audioCtx.currentTime + AUDIO_START_DELAY;
-      if (this.wantPlaying) {
-        this.resumeAudio();
-      } else {
-        this.pauseAudioOutput({ pauseSink: true });
-        this.setState('paused');
-      }
+    if (!haveVideo || !haveAudio) return;
+
+    // HE-AAC can advertise its core rate in the MP4 config while AudioDecoder
+    // outputs at twice that rate. Trust the decoded PCM here. Matching it avoids
+    // restarting a resampler at every source-node boundary (constant crackle).
+    const first = this.decodedAudio[0];
+    if (first && first.sampleRate !== this.audioCtx.sampleRate) {
+      this.matchAudioContextRate(first.sampleRate);
+    }
+
+    this.ctxStartTime = this.audioCtx.currentTime + AUDIO_START_DELAY;
+    if (this.wantPlaying) {
+      this.resumeAudio();
+    } else {
+      this.pauseAudioOutput({ pauseSink: true });
+      this.setState('paused');
     }
   }
 
@@ -514,84 +536,97 @@ export class CanvasPlayer {
   private scheduleAudio() {
     if (this.ctxStartTime === null) return;
     const now = this.audioCtx.currentTime;
+    // Refill in large batches only after the scheduled chain falls below the
+    // low-water mark. This greatly reduces source-node creation and GC churn.
+    if (this.nextAudioStartTime !== 0 && this.nextAudioStartTime - now > AUDIO_AHEAD_LOW) return;
+
     while (this.decodedAudio.length) {
-      const data = this.decodedAudio[0];
-      const mediaTs = data.timestamp / 1e6;
-      const idealWhen = this.ctxStartTime + (mediaTs - this.baseMediaTime);
-      // Chain chunks sample-accurately: each starts exactly where the previous
-      // one ends. Container timestamps are rounded to whole microseconds, so
-      // scheduling by timestamp leaves sub-sample seams between chunks —
-      // audible as periodic clicks at higher volume. The timestamp is only a
-      // fallback when it genuinely disagrees with the chain (first chunk,
-      // post-seek, dropped chunk, or the chain slipped into the past after a
-      // main-thread stall).
-      let when = this.nextAudioStartTime;
-      if (when === 0 || when < now || Math.abs(when - idealWhen) > 0.05) {
-        when = Math.max(idealWhen, now);
+      const head = this.decodedAudio[0];
+      const rate = head.sampleRate;
+      const channels = head.numberOfChannels;
+      const headTs = head.timestamp / 1e6;
+      const headDuration = head.numberOfFrames / rate;
+
+      // A seek starts demuxing at an earlier random-access point. Discard PCM
+      // before the requested position and trim the chunk that straddles it.
+      let startOffsetSec = 0;
+      if (this.nextAudioStartTime === 0) {
+        if (headTs + headDuration <= this.baseMediaTime) {
+          this.decodedAudio.shift();
+          head.close();
+          continue;
+        }
+        startOffsetSec = Math.min(Math.max(0, this.baseMediaTime - headTs), headDuration);
       }
-      // Only schedule within the look-ahead window.
-      if (when > now + AUDIO_SCHEDULE_AHEAD) break;
-      const batch = this.takeAudioBatch();
-      if (!batch) break;
+
+      const audibleTs = headTs + startOffsetSec;
+      const idealWhen = this.ctxStartTime + (audibleTs - this.baseMediaTime);
+      // Chain chunks sample-accurately: each starts exactly where the previous
+      // one ends. Scheduling every AAC packet by its rounded timestamp creates
+      // a tiny seam at every packet boundary.
+      let when: number;
+      if (this.nextAudioStartTime === 0) {
+        when = Math.max(idealWhen, now + 0.02);
+      } else {
+        when = this.nextAudioStartTime;
+        if (when < now) {
+          // The main thread stalled beyond all scheduled audio. Re-anchor both
+          // audio and the video clock; simply clamping every source to `now`
+          // would overlap them and produce the characteristic garbled buzz.
+          const target = now + 0.05;
+          this.ctxStartTime += target - idealWhen;
+          when = target;
+          report('warn', 'player', `audio underrun — clock rebased ${(target - idealWhen).toFixed(3)}s`);
+        } else if (Math.abs(idealWhen - when) > AUDIO_DISCONTINUITY_SEC) {
+          when = Math.max(idealWhen, this.nextAudioStartTime);
+        }
+      }
+
+      if (when > now + AUDIO_AHEAD_HIGH) break;
+
+      // Coalesce all currently decoded, contiguous PCM into one AudioBuffer.
+      // On Tesla this is usually 1–2 seconds rather than one node per AAC frame.
+      const batch: AudioData[] = [this.decodedAudio.shift()!];
+      let frames = head.numberOfFrames;
+      let endTs = headTs + headDuration;
+      while (this.decodedAudio.length) {
+        const next = this.decodedAudio[0];
+        if (next.sampleRate !== rate || next.numberOfChannels !== channels) break;
+        if (Math.abs(next.timestamp / 1e6 - endTs) > AUDIO_BATCH_GAP_TOLERANCE_SEC) break;
+        if (when + frames / rate >= now + AUDIO_AHEAD_HIGH) break;
+        this.decodedAudio.shift();
+        batch.push(next);
+        frames += next.numberOfFrames;
+        endTs = next.timestamp / 1e6 + next.numberOfFrames / rate;
+      }
+
+      let buffer: AudioBuffer;
+      try {
+        buffer = this.audioCtx.createBuffer(channels, frames, rate);
+        const channelData = Array.from({ length: channels }, () => new Float32Array(frames));
+        let offset = 0;
+        for (const data of batch) {
+          for (let ch = 0; ch < channels; ch++) {
+            const dest = channelData[ch].subarray(offset, offset + data.numberOfFrames);
+            // Conversion to f32-planar is the WebCodecs-mandated Web Audio path,
+            // including when the decoder's native output is interleaved.
+            data.copyTo(dest, { planeIndex: ch, format: 'f32-planar' });
+          }
+          offset += data.numberOfFrames;
+        }
+        for (let ch = 0; ch < channels; ch++) buffer.copyToChannel(channelData[ch], ch);
+      } finally {
+        for (const data of batch) data.close();
+      }
 
       const src = this.audioCtx.createBufferSource();
-      src.buffer = batch.buffer;
+      src.buffer = buffer;
       src.connect(this.gain);
-      src.start(when);
+      src.start(when, startOffsetSec);
       this.activeSources.add(src);
       src.onended = () => this.activeSources.delete(src);
-      this.nextAudioStartTime = when + batch.duration;
-      this.lastAudioScheduledSec = mediaTs + batch.duration;
-    }
-  }
-
-  private takeAudioBatch(): { buffer: AudioBuffer; duration: number } | null {
-    const first = this.decodedAudio[0];
-    if (!first) return null;
-
-    const channels = first.numberOfChannels;
-    const rate = first.sampleRate;
-    const batch: AudioData[] = [];
-    let frames = 0;
-    let expectedTs = first.timestamp / 1e6;
-
-    while (this.decodedAudio.length) {
-      const data = this.decodedAudio[0];
-      if (data.numberOfChannels !== channels || data.sampleRate !== rate) break;
-
-      const ts = data.timestamp / 1e6;
-      if (batch.length > 0 && Math.abs(ts - expectedTs) > AUDIO_BATCH_GAP_TOLERANCE_SEC) break;
-
-      this.decodedAudio.shift();
-      batch.push(data);
-      frames += data.numberOfFrames;
-      expectedTs = ts + data.numberOfFrames / data.sampleRate;
-      if (frames / rate >= AUDIO_BATCH_TARGET_SEC) break;
-    }
-
-    if (batch.length === 0) return null;
-    try {
-      const buffer = this.audioCtx.createBuffer(channels, frames, rate);
-      const channelData = Array.from({ length: channels }, () => new Float32Array(frames));
-      let offset = 0;
-
-      for (const data of batch) {
-        for (let ch = 0; ch < channels; ch++) {
-          const dest = channelData[ch].subarray(offset, offset + data.numberOfFrames);
-          try {
-            data.copyTo(dest, { planeIndex: ch, format: 'f32-planar' });
-          } catch {
-            // Some decoders emit interleaved; fall back to plane 0 rather than
-            // dropping the chunk and causing an audible hole.
-            data.copyTo(dest, { planeIndex: 0, format: 'f32-planar' });
-          }
-        }
-        offset += data.numberOfFrames;
-      }
-      for (let ch = 0; ch < channels; ch++) buffer.copyToChannel(channelData[ch], ch);
-      return { buffer, duration: frames / rate };
-    } finally {
-      for (const data of batch) data.close();
+      this.nextAudioStartTime = when + (frames / rate - startOffsetSec);
+      this.lastAudioScheduledSec = endTs;
     }
   }
 
@@ -847,6 +882,8 @@ export class CanvasPlayer {
   private teardownPipeline() {
     if (this.raf) cancelAnimationFrame(this.raf);
     this.raf = 0;
+    if (this.audioTimer) clearInterval(this.audioTimer);
+    this.audioTimer = 0;
     this.videoDemuxer?.destroy();
     this.audioDemuxer?.destroy();
     this.videoDemuxer = null;
